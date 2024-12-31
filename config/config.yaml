@@ -9,7 +9,7 @@ mysql:
 
 sync:
   interval: 10000
-  blockLimitPerInterval: 20
+  blockLimitPerInterval: 1000
   blockSyncStart: 15742000
 
   clearInterval: 120000
@@ -33,5 +33,6 @@ sync:
       hashType: "type"
 
   isMainnet: false
+  maxConcurrent: 2048
   ckbRpcUri: wss://testnet.ckb.dev/ws
   btcRpcUri: https://rpc.ankr.com/btc_signet

@@ -23,6 +23,57 @@ import { UdtParserBuilder } from "./udtParser";
 const SYNC_KEY = "SYNCED";
 const PENDING_KEY = "PENDING";
 
+type GeneratedBlock = {
+  height: ccc.Num;
+  block?: ccc.ClientBlock;
+  txs: {
+    tx: ccc.Transaction;
+    prefetchedInputs: Promise<ccc.CellInput>[];
+  }[];
+};
+// get block in range (start, end]
+async function* getBlocks(
+  client: ccc.Client,
+  startLike: ccc.NumLike,
+  endLike: ccc.NumLike,
+): AsyncGenerator<GeneratedBlock> {
+  const start = ccc.numFrom(startLike);
+  const end = ccc.numFrom(endLike);
+
+  const blocksLength = Number(end - start);
+  // Prefetch for performance
+  const blocks = [];
+  for (let i = 0; i < blocksLength; i += 1) {
+    const height = ccc.numFrom(i + 1) + start;
+    blocks.push(
+      (async (): Promise<GeneratedBlock> => {
+        const block = await client.getBlockByNumber(height);
+
+        if (i) {
+          await blocks[i - 1];
+        }
+
+        const txs = [];
+        for (const tx of block?.transactions ?? []) {
+          txs.push({
+            tx,
+            prefetchedInputs: tx.inputs.map(async (input) => {
+              await input.completeExtraInfos(client);
+              return input;
+            }),
+          });
+        }
+
+        return { height, block, txs };
+      })(),
+    );
+  }
+
+  for (const block of blocks) {
+    yield await block;
+  }
+}
+
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
@@ -45,7 +96,12 @@ export class SyncService {
     private readonly udtBalanceRepo: UdtBalanceRepo,
     private readonly blockRepo: BlockRepo,
   ) {
-    this.client = new ccc.ClientPublicTestnet();
+    const isMainnet = configService.get<boolean>("sync.isMainnet");
+    const ckbRpcUri = configService.get<string>("sync.ckbRpcUri");
+    const maxConcurrent = configService.get<number>("sync.maxConcurrent");
+    this.client = isMainnet
+      ? new ccc.ClientPublicMainnet({ url: ckbRpcUri, maxConcurrent })
+      : new ccc.ClientPublicTestnet({ url: ckbRpcUri, maxConcurrent });
 
     this.blockLimitPerInterval = configService.get<number>(
       "sync.blockLimitPerInterval",
@@ -65,82 +121,96 @@ export class SyncService {
   }
 
   async sync() {
-    const pendingStatus = await this.syncStatusRepo.syncHeight(PENDING_KEY, this.blockSyncStart);
-    const pendingHeight = parseSortableInt(pendingStatus.value);
+    // Will break when endBlock === tip
+    while (true) {
+      const pendingStatus = await this.syncStatusRepo.syncHeight(
+        PENDING_KEY,
+        this.blockSyncStart,
+      );
+      const pendingHeight = parseSortableInt(pendingStatus.value);
 
-    const tip = await this.client.getTip();
-    const tipTime = Date.now();
-    const tipCost =
-      this.startTip !== undefined && this.startTipTime !== undefined
-        ? (tipTime - this.startTipTime) / Number(tip - this.startTip)
-        : 9999999999;
-    if (this.startTip === undefined || this.startTipTime === undefined) {
-      this.startTip = tip;
-      this.startTipTime = tipTime;
-    }
-
-    const endBlock =
-      this.blockLimitPerInterval === undefined
-        ? tip
-        : ccc.numMin(
-            pendingHeight + ccc.numFrom(this.blockLimitPerInterval),
-            tip,
-          );
-
-    for (
-      let i = pendingHeight + ccc.numFrom(1);
-      i <= endBlock;
-      i += ccc.numFrom(1)
-    ) {
-      const block = await this.client.getBlockByNumber(i);
-      if (!block) {
-        this.logger.error(`Failed to get block ${i}`);
-        break;
+      const tipTime = Date.now();
+      const tip = await this.client.getTip();
+      const tipCost =
+        this.startTip !== undefined && this.startTipTime !== undefined
+          ? (tipTime - this.startTipTime) / Number(tip - this.startTip)
+          : 9999999999;
+      if (this.startTip === undefined || this.startTipTime === undefined) {
+        this.startTip = tip;
+        this.startTipTime = tipTime;
       }
 
-      const udtParser = this.udtParserBuilder.build(i);
+      const endBlock =
+        this.blockLimitPerInterval === undefined
+          ? tip
+          : ccc.numMin(
+              pendingHeight + ccc.numFrom(this.blockLimitPerInterval),
+              tip,
+            );
 
-      await withTransaction(
-        this.entityManager,
-        undefined,
-        async (entityManager) => {
-          const blockRepo = new BlockRepo(entityManager);
-          const syncStatusRepo = new SyncStatusRepo(entityManager);
-          await blockRepo.insert({
-            hash: block.header.hash,
-            parentHash: block.header.parentHash,
-            height: formatSortableInt(block.header.number),
-            timestamp: Number(block.header.timestamp / 1000n),
-          });
+      let txsCount = 0;
+      for await (const { height, block, txs } of getBlocks(
+        this.client,
+        pendingHeight,
+        endBlock,
+      )) {
+        txsCount += txs.length;
+        if (!block) {
+          this.logger.error(`Failed to get block ${height}`);
+          break;
+        }
 
-          for (const tx of block.transactions) {
-            await udtParser.udtInfoHandleTx(entityManager, tx);
-          }
+        const udtParser = this.udtParserBuilder.build(height);
 
-          await syncStatusRepo.updateSyncHeight(pendingStatus, i);
-        },
-      );
+        await withTransaction(
+          this.entityManager,
+          undefined,
+          async (entityManager) => {
+            const blockRepo = new BlockRepo(entityManager);
+            const syncStatusRepo = new SyncStatusRepo(entityManager);
+            await blockRepo.insert({
+              hash: block.header.hash,
+              parentHash: block.header.parentHash,
+              height: formatSortableInt(block.header.number),
+              timestamp: Number(block.header.timestamp / 1000n),
+            });
 
-      this.syncedBlocks += 1;
+            for (const { tx, prefetchedInputs } of txs) {
+              await udtParser.udtInfoHandleTx(
+                entityManager,
+                tx,
+                prefetchedInputs,
+              );
+            }
 
-      const blocksDiff = Number(tip - i);
-      const syncCost =
-        (this.syncedBlockTime + Date.now() - tipTime) / this.syncedBlocks;
+            await syncStatusRepo.updateSyncHeight(pendingStatus, height);
+          },
+        );
+
+        this.syncedBlocks += 1;
+      }
+
+      this.syncedBlockTime += Date.now() - tipTime;
+
+      const blocksDiff = Number(tip - endBlock);
+      const syncCost = this.syncedBlockTime / this.syncedBlocks;
       const estimatedTime =
         (blocksDiff * syncCost * tipCost) / (tipCost - syncCost);
       this.logger.log(
-        `Tip ${tip}, synced block ${i}, ${blocksDiff} blocks / ~${estimatedTime !== undefined ? (estimatedTime / 1000 / 60).toFixed(1) : "-"} mins left. ${block.transactions.length} transactions processed`,
+        `Tip ${tip}, synced block ${endBlock}, ${blocksDiff} blocks / ~${estimatedTime !== undefined ? (estimatedTime / 1000 / 60).toFixed(1) : "-"} mins left. ${txsCount} transactions processed`,
       );
-    }
 
-    this.syncedBlockTime += Date.now() - tipTime;
+      if (endBlock === tip) {
+        break;
+      }
+    }
   }
 
   async clear() {
     if (this.confirmations === undefined) {
       return;
     }
-    if (!await this.syncStatusRepo.initialized()) {
+    if (!(await this.syncStatusRepo.initialized())) {
       return;
     }
 

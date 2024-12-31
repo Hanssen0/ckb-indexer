@@ -102,11 +102,12 @@ class UdtParser {
   async udtInfoHandleTx(
     entityManager: EntityManager,
     txLike: ccc.TransactionLike,
+    prefetchedInputs: Promise<ccc.CellInput>[],
   ) {
     const tx = ccc.Transaction.from(txLike);
     const txHash = tx.hash();
 
-    const udtTypes = await this.getUdtTypesInTx(tx);
+    const udtTypes = await this.getUdtTypesInTx(tx, prefetchedInputs);
 
     await withTransaction(
       this.context.entityManager,
@@ -119,7 +120,7 @@ class UdtParser {
           const tokenHash = udtType.hash();
 
           const { diffs, netBalance, netCapacity } =
-            await this.getBalanceDiffInTx(tx, udtType);
+            await this.getBalanceDiffInTx(tx, prefetchedInputs, udtType);
 
           /* === Update UDT Info === */
           const existedUdtInfo = await udtInfoRepo.findOne({
@@ -239,36 +240,48 @@ class UdtParser {
     );
   }
 
-  async getUdtTypesInTx(txLike: ccc.TransactionLike): Promise<ccc.Script[]> {
+  async getUdtTypesInTx(
+    txLike: ccc.TransactionLike,
+    prefetchedInputs: Promise<ccc.CellInput>[],
+  ): Promise<ccc.Script[]> {
     const tx = ccc.Transaction.from(txLike);
 
-    const scripts: Map<string, ccc.Script> = new Map();
+    const scripts: ccc.Bytes[] = [];
     await Promise.all(
-      tx.inputs.map(async (input) => {
-        await input.completeExtraInfos(this.context.client);
+      prefetchedInputs.map(async (p) => {
+        const input = await p;
         if (!input.cellOutput?.type) {
           return;
         }
-        scripts.set(input.cellOutput.type.hash(), input.cellOutput.type);
+        const rawType = input.cellOutput.type.toBytes();
+
+        if (!scripts.some((s) => ccc.bytesEq(s, rawType))) {
+          scripts.push(rawType);
+        }
       }),
     );
     for (const output of tx.outputs) {
       if (!output.type) {
         continue;
       }
-      scripts.set(output.type.hash(), output.type);
+      const rawType = output.type.toBytes();
+
+      if (!scripts.some((s) => ccc.bytesEq(s, rawType))) {
+        scripts.push(rawType);
+      }
     }
 
-    return ccc.reduceAsync(
-      Array.from(scripts.values()),
-      async (acc: ccc.Script[], script) => {
-        if (!(await this.isTypeUdt(script))) {
-          return;
-        }
-        acc.push(script);
-      },
-      [],
-    );
+    return (
+      await Promise.all(
+        scripts.map(async (raw) => {
+          const script = ccc.Script.fromBytes(raw);
+          if (!(await this.isTypeUdt(script))) {
+            return;
+          }
+          return script;
+        }),
+      )
+    ).filter((s) => s !== undefined);
   }
 
   async isTypeUdt(scriptLike: ccc.ScriptLike): Promise<boolean> {
@@ -291,6 +304,7 @@ class UdtParser {
 
   async getBalanceDiffInTx(
     txLike: ccc.TransactionLike,
+    prefetchedInputs: Promise<ccc.CellInput>[],
     udtTypeLike: ccc.ScriptLike,
   ): Promise<{
     diffs: { lock: ccc.Script; balance: ccc.Num; capacity: ccc.Num }[];
@@ -300,32 +314,32 @@ class UdtParser {
     const tx = ccc.Transaction.from(txLike);
     const udtType = ccc.Script.from(udtTypeLike);
 
-    const diffs: Map<
-      string,
-      { lock: ccc.Script; balance: ccc.Num; capacity: ccc.Num }
-    > = new Map();
+    const diffs: { lock: ccc.Bytes; balance: ccc.Num; capacity: ccc.Num }[] =
+      [];
     let netBalance = ccc.Zero;
     let netCapacity = ccc.Zero;
 
     await Promise.all(
-      tx.inputs.map(async (input) => {
-        await input.completeExtraInfos(this.context.client);
+      prefetchedInputs.map(async (p) => {
+        const input = await p;
         if (!input.cellOutput?.type || !input.cellOutput.type.eq(udtType)) {
           return;
         }
-        const lock = input.cellOutput.lock;
-        const lockHash = lock.hash();
-        const diff = diffs.get(lockHash) ?? {
-          lock,
-          balance: ccc.Zero,
-          capacity: ccc.Zero,
-        };
+        const rawLock = input.cellOutput.lock.toBytes();
+
+        const diff =
+          diffs.find(({ lock }) => ccc.bytesEq(lock, rawLock)) ??
+          diffs[
+            diffs.push({
+              lock: rawLock,
+              balance: ccc.Zero,
+              capacity: ccc.Zero,
+            }) - 1
+          ];
 
         const balance = ccc.udtBalanceFrom(input.outputData ?? "00".repeat(16));
         diff.balance -= balance;
         diff.capacity -= input.cellOutput.capacity;
-
-        diffs.set(lockHash, diff);
 
         netBalance -= balance;
         netCapacity -= input.cellOutput.capacity;
@@ -339,26 +353,30 @@ class UdtParser {
         continue;
       }
 
-      const lock = output.lock;
-      const lockHash = lock.hash();
-      const diff = diffs.get(lockHash) ?? {
-        lock,
-        balance: ccc.Zero,
-        capacity: ccc.Zero,
-      };
+      const rawLock = output.lock.toBytes();
+      const diff =
+        diffs.find(({ lock }) => ccc.bytesEq(lock, rawLock)) ??
+        diffs[
+          diffs.push({
+            lock: rawLock,
+            balance: ccc.Zero,
+            capacity: ccc.Zero,
+          }) - 1
+        ];
 
       const balance = ccc.udtBalanceFrom(outputData ?? "00".repeat(16));
       diff.balance += balance;
       diff.capacity += output.capacity;
-
-      diffs.set(lockHash, diff);
 
       netBalance += balance;
       netCapacity += output.capacity;
     }
 
     return {
-      diffs: Array.from(diffs.values()),
+      diffs: diffs.map((diff) => ({
+        ...diff,
+        lock: ccc.Script.fromBytes(diff.lock),
+      })),
       netBalance,
       netCapacity,
     };
