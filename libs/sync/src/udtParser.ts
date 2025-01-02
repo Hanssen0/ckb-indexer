@@ -14,8 +14,8 @@ import { EntityManager } from "typeorm";
 import { UdtBalanceRepo, UdtInfoRepo } from "./repos";
 
 @Injectable()
-export class UdtParserBuilder {
-  public readonly logger = new Logger(UdtParserBuilder.name);
+export class UdtParser {
+  public readonly logger = new Logger(UdtParser.name);
   public readonly btcRequester: Axios;
   public readonly client: ccc.Client;
 
@@ -51,76 +51,36 @@ export class UdtParserBuilder {
     this.udtTypes = udtTypes.map((t) => ccc.Script.from({ ...t, args: "" }));
   }
 
-  build(blockHeight: ccc.NumLike): UdtParser {
-    return new UdtParser(this, ccc.numFrom(blockHeight));
-  }
-}
-
-class UdtParser {
-  constructor(
-    public readonly context: UdtParserBuilder,
-    public readonly blockHeight: ccc.Num,
-  ) {}
-
-  async scriptToAddress(scriptLike: ccc.ScriptLike): Promise<string> {
-    const script = ccc.Script.from(scriptLike);
-
-    if (
-      script.codeHash === this.context.rgbppBtcCodeHash &&
-      script.hashType === this.context.rgbppBtcHashType
-    ) {
-      const decoded = (() => {
-        try {
-          return RgbppLockArgs.decode(script.args);
-        } catch (err) {
-          this.context.logger.warn(
-            `Failed to decode rgbpp lock args ${script.args}: ${err.message}`,
-          );
-        }
-      })();
-
-      if (decoded) {
-        const { outIndex, txId } = decoded;
-        const { data } = await this.context.btcRequester.post("/", {
-          method: "getrawtransaction",
-          params: [txId.slice(2), true],
-        });
-
-        if (data?.result?.vout?.[outIndex]?.scriptPubKey?.address == null) {
-          this.context.logger.warn(
-            `Failed to get btc rgbpp utxo ${txId}:${outIndex}`,
-          );
-        } else {
-          return data?.result?.vout?.[outIndex]?.scriptPubKey?.address;
-        }
-      }
-    }
-
-    return ccc.Address.fromScript(script, this.context.client).toString();
+  async udtInfoHandleTx(tx: ccc.Transaction) {
+    return Promise.all(
+      (await this.getUdtTypesInTx(tx)).map(async (udtType) => ({
+        ...(await this.getBalanceDiffInTx(tx, udtType)),
+        udtType,
+      })),
+    );
   }
 
-  async udtInfoHandleTx(
+  async saveDiffs(
     entityManager: EntityManager,
-    txLike: ccc.TransactionLike,
-    prefetchedInputs: Promise<ccc.CellInput>[],
+    tx: ccc.Transaction,
+    blockHeight: ccc.Num,
+    udtDiffs: {
+      udtType: ccc.Script;
+      diffs: { lock: ccc.Script; balance: ccc.Num; capacity: ccc.Num }[];
+      netBalance: ccc.Num;
+      netCapacity: ccc.Num;
+    }[],
   ) {
-    const tx = ccc.Transaction.from(txLike);
     const txHash = tx.hash();
-
-    const udtTypes = await this.getUdtTypesInTx(tx, prefetchedInputs);
-
     await withTransaction(
-      this.context.entityManager,
+      this.entityManager,
       entityManager,
       async (entityManager) => {
         const udtInfoRepo = new UdtInfoRepo(entityManager);
         const udtBalanceRepo = new UdtBalanceRepo(entityManager);
 
-        for (const udtType of udtTypes) {
+        for (const { udtType, diffs, netBalance, netCapacity } of udtDiffs) {
           const tokenHash = udtType.hash();
-
-          const { diffs, netBalance, netCapacity } =
-            await this.getBalanceDiffInTx(tx, prefetchedInputs, udtType);
 
           /* === Update UDT Info === */
           const existedUdtInfo = await udtInfoRepo.findOne({
@@ -136,7 +96,7 @@ class UdtParser {
             ...(existedUdtInfo ?? {
               hash: tokenHash,
 
-              updatedAtHeight: formatSortable(this.blockHeight),
+              updatedAtHeight: formatSortable(blockHeight),
 
               typeCodeHash: udtType.codeHash,
               typeHashType: udtType.hashType,
@@ -148,8 +108,7 @@ class UdtParser {
             }),
             id:
               existedUdtInfo &&
-              parseSortableInt(existedUdtInfo.updatedAtHeight) ===
-                this.blockHeight
+              parseSortableInt(existedUdtInfo.updatedAtHeight) === blockHeight
                 ? existedUdtInfo.id
                 : undefined,
           });
@@ -179,11 +138,11 @@ class UdtParser {
             }
           }
 
-          udtInfo.updatedAtHeight = formatSortableInt(this.blockHeight);
+          udtInfo.updatedAtHeight = formatSortableInt(blockHeight);
           await udtInfoRepo.save(udtInfo);
 
           if (!existedUdtInfo) {
-            this.context.logger.log(
+            this.logger.log(
               `New token ${tokenHash} ${udtInfo.name}(${udtInfo.symbol}) found at tx ${txHash}`,
             );
           }
@@ -209,7 +168,7 @@ class UdtParser {
                   addressHash,
                   tokenHash,
 
-                  updatedAtHeight: formatSortable(this.blockHeight),
+                  updatedAtHeight: formatSortable(blockHeight),
 
                   address,
                   balance: formatSortable("0"),
@@ -218,7 +177,7 @@ class UdtParser {
                 id:
                   existedUdtBalance &&
                   parseSortableInt(existedUdtBalance.updatedAtHeight) ===
-                    this.blockHeight
+                    blockHeight
                     ? existedUdtBalance.id
                     : undefined,
               });
@@ -230,7 +189,7 @@ class UdtParser {
                 parseSortableInt(udtBalance.capacity) + diff.capacity,
               );
 
-              udtBalance.updatedAtHeight = formatSortableInt(this.blockHeight);
+              udtBalance.updatedAtHeight = formatSortableInt(blockHeight);
               await udtBalanceRepo.save(udtBalance);
             }),
           );
@@ -240,16 +199,10 @@ class UdtParser {
     );
   }
 
-  async getUdtTypesInTx(
-    txLike: ccc.TransactionLike,
-    prefetchedInputs: Promise<ccc.CellInput>[],
-  ): Promise<ccc.Script[]> {
-    const tx = ccc.Transaction.from(txLike);
-
+  async getUdtTypesInTx(tx: ccc.Transaction): Promise<ccc.Script[]> {
     const scripts: ccc.Bytes[] = [];
     await Promise.all(
-      prefetchedInputs.map(async (p) => {
-        const input = await p;
+      tx.inputs.map(async (input) => {
         if (!input.cellOutput?.type) {
           return;
         }
@@ -284,11 +237,9 @@ class UdtParser {
     ).filter((s) => s !== undefined);
   }
 
-  async isTypeUdt(scriptLike: ccc.ScriptLike): Promise<boolean> {
-    const script = ccc.Script.from(scriptLike);
-
+  async isTypeUdt(script: ccc.Script): Promise<boolean> {
     if (
-      this.context.udtTypes.some(
+      this.udtTypes.some(
         ({ codeHash, hashType }) =>
           script.codeHash === codeHash && script.hashType === hashType,
       )
@@ -303,25 +254,20 @@ class UdtParser {
   }
 
   async getBalanceDiffInTx(
-    txLike: ccc.TransactionLike,
-    prefetchedInputs: Promise<ccc.CellInput>[],
-    udtTypeLike: ccc.ScriptLike,
+    tx: ccc.Transaction,
+    udtType: ccc.Script,
   ): Promise<{
     diffs: { lock: ccc.Script; balance: ccc.Num; capacity: ccc.Num }[];
     netBalance: ccc.Num;
     netCapacity: ccc.Num;
   }> {
-    const tx = ccc.Transaction.from(txLike);
-    const udtType = ccc.Script.from(udtTypeLike);
-
     const diffs: { lock: ccc.Bytes; balance: ccc.Num; capacity: ccc.Num }[] =
       [];
     let netBalance = ccc.Zero;
     let netCapacity = ccc.Zero;
 
     await Promise.all(
-      prefetchedInputs.map(async (p) => {
-        const input = await p;
+      tx.inputs.map(async (input) => {
         if (!input.cellOutput?.type || !input.cellOutput.type.eq(udtType)) {
           return;
         }
@@ -382,13 +328,12 @@ class UdtParser {
     };
   }
 
-  async getTokenInfoInTx(txLike: ccc.TransactionLike): Promise<{
+  async getTokenInfoInTx(tx: ccc.Transaction): Promise<{
     decimals: number | null;
     name: string | null;
     symbol: string | null;
   }> {
-    const tx = ccc.Transaction.from(txLike);
-    const uniqueType = await this.context.client.getKnownScript(
+    const uniqueType = await this.client.getKnownScript(
       ccc.KnownScript.UniqueType,
     );
 
@@ -442,5 +387,38 @@ class UdtParser {
     }
 
     return { name: null, symbol: null, decimals: null };
+  }
+
+  async scriptToAddress(script: ccc.Script): Promise<string> {
+    if (
+      script.codeHash === this.rgbppBtcCodeHash &&
+      script.hashType === this.rgbppBtcHashType
+    ) {
+      const decoded = (() => {
+        try {
+          return RgbppLockArgs.decode(script.args);
+        } catch (err) {
+          this.logger.warn(
+            `Failed to decode rgbpp lock args ${script.args}: ${err.message}`,
+          );
+        }
+      })();
+
+      if (decoded) {
+        const { outIndex, txId } = decoded;
+        const { data } = await this.btcRequester.post("/", {
+          method: "getrawtransaction",
+          params: [txId.slice(2), true],
+        });
+
+        if (data?.result?.vout?.[outIndex]?.scriptPubKey?.address == null) {
+          this.logger.warn(`Failed to get btc rgbpp utxo ${txId}:${outIndex}`);
+        } else {
+          return data?.result?.vout?.[outIndex]?.scriptPubKey?.address;
+        }
+      }
+    }
+
+    return ccc.Address.fromScript(script, this.client).toString();
   }
 }
